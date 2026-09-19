@@ -1,0 +1,2 @@
+# ArknightsDesktopPets
+未使用LangChain等Agent架构写的一个PythonAI桌宠，角色为《明日方舟》中的角色
