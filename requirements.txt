@@ -1,0 +1,5 @@
+# LLM 调用（DeepSeek 通过 OpenAI 兼容接口访问）
+openai>=1.0.0
+
+# 桌面宠物 UI（开发中）
+PySide6>=6.7.0
