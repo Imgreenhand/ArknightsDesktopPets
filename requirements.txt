@@ -1,5 +1,8 @@
 # LLM 调用（DeepSeek 通过 OpenAI 兼容接口访问）
 openai>=1.0.0
 
+# 向量与相似度计算
+numpy>=1.24
+
 # 桌面宠物 UI（开发中）
 PySide6>=6.7.0
