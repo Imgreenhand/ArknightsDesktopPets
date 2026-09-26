@@ -39,6 +39,8 @@ class MemNode:
     # 上次被激活（想起）的时间，0 表示从未激活，仅用于冷却判断
     last_decay_at: float = 0.0
     # 上次结算遗忘的时间，用于避免衰减被重复叠加
+    mention_count: int = 0
+    # 被提起（激活）过的次数：决定遗忘速度和是否免疫遗忘
 
 
 class MemoryGraph:
@@ -48,7 +50,9 @@ class MemoryGraph:
     COLD_DOWN_FACTOR = 0.3
     MAX_WEIGHT = 20.0               # 权重软上限，防止热门记忆无限膨胀
     DECAY_BASE = 0.5                # 每深一层，联想强度乘一次
-    DEFAULT_FORGET_TAU = 7 * 24 * 3600.0  # 遗忘时间常数，默认一周
+    DEFAULT_FORGET_TAU = 7 * 24 * 3600.0  # 首次被提起后的遗忘时间常数，默认一周
+    REINFORCE_GROWTH = 2.0          # 每多被提起一次，遗忘时间常数翻倍（衰减变慢）
+    FORGET_IMMUNE_MENTIONS = 5      # 被提起达到这个次数后，完全不再遗忘
 
     def __init__(self):
         self.nodes: dict[str, MemNode] = {}
@@ -187,12 +191,16 @@ class MemoryGraph:
 
     def update_weights(self, start_id: str, activated: dict[str, tuple[int, float]],
                        current_time: float | None = None) -> None:
-        """按扩散结果加权：起点额外 +0.5（触景生情），其余按 入边相似度 * 0.5^深度 衰减"""
+        """按扩散结果加权：起点额外 +0.5（触景生情），其余按 入边相似度 * 0.5^深度 衰减
+
+        每个被激活的节点都算「被提起一次」：保存度回到 1，且之后的衰减速度会变慢。
+        """
         now = time.time() if current_time is None else current_time
 
         if start_id in self.nodes:
-            self.nodes[start_id].weight = min(self.nodes[start_id].weight + 0.5, self.MAX_WEIGHT)
-            self.nodes[start_id].last_activated_at = now
+            start_node = self.nodes[start_id]
+            start_node.weight = min(start_node.weight + 0.5, self.MAX_WEIGHT)
+            self._mark_mentioned(start_node, now)
 
         for nid, (depth, edge_similarity) in activated.items():
             node = self.nodes.get(nid)
@@ -203,9 +211,41 @@ class MemoryGraph:
             if now - node.last_activated_at < self.COLD_DOWN_SECONDS:
                 bonus *= self.COLD_DOWN_FACTOR
             node.weight = min(node.weight + bonus, self.MAX_WEIGHT)
-            node.last_activated_at = now
+            self._mark_mentioned(node, now)
+
+    def _mark_mentioned(self, node: MemNode, current_time: float) -> None:
+        """记一次「被提起」：保存度回到 1，之后再衰减时速度更慢"""
+        node.mention_count += 1
+        node.last_activated_at = current_time
 
     # ---------- 遗忘 ----------
+
+    def _decay_tau(self, mention_count: int, tau: float) -> float | None:
+        """这次提及对应的遗忘时间常数
+
+        被提起次数越多，时间常数越大（衰减越慢）；返回 None 表示已免疫，不再遗忘。
+        """
+        if mention_count >= self.FORGET_IMMUNE_MENTIONS:
+            return None
+        return tau * (self.REINFORCE_GROWTH ** max(mention_count - 1, 0))
+
+    def retention(self, nid: str, current_time: float | None = None,
+                  tau: float | None = None) -> float:
+        """保存度 w ∈ [0, 1]：刚被提起时为 1，之后随时间衰减向 0
+
+        - 首次被提起后按 tau 衰减，一周左右就接近 0；
+        - 衰减途中再次被提起，w 重置为 1，且时间常数翻倍，所以第二次衰减明显更慢；
+        - 被提起达到 FORGET_IMMUNE_MENTIONS 次后恒为 1，永不遗忘。
+        """
+        node = self.nodes.get(nid)
+        if node is None:
+            return 0.0
+        decay_tau = self._decay_tau(node.mention_count, self.DEFAULT_FORGET_TAU if tau is None else tau)
+        if decay_tau is None:
+            return 1.0
+        now = time.time() if current_time is None else current_time
+        baseline = max(node.created_at, node.last_activated_at)
+        return math.exp(-max(now - baseline, 0.0) / decay_tau)
 
     def apply_forgetting(self, current_time: float | None = None,
                          tau: float | None = None,
@@ -213,18 +253,21 @@ class MemoryGraph:
         """让记忆随时间淡出：weight *= exp(-Δt / tau)
 
         Δt 从上一次“被激活或上次结算遗忘”算起，因此可重复调用而不会重复叠加衰减。
-        prune_floor 不为 None 时，权重低于该阈值的记忆会被彻底清理，返回被清理的节点 ID。
+        每条记忆的 tau 由它的被提起次数决定：提得越多衰减越慢，提满 FORGET_IMMUNE_MENTIONS
+        次后完全不再衰减。prune_floor 不为 None 时，权重低于该阈值的记忆会被彻底清理
+        （已免疫的记忆不会被清理），返回被清理的节点 ID。
         """
         now = time.time() if current_time is None else current_time
-        if tau is None:
-            tau = self.DEFAULT_FORGET_TAU
+        base_tau = self.DEFAULT_FORGET_TAU if tau is None else tau
 
         faint: list[str] = []
         for nid, node in self.nodes.items():
-            baseline = max(node.created_at, node.last_activated_at, node.last_decay_at)
-            node.weight *= math.exp(-(now - baseline) / tau)
+            decay_tau = self._decay_tau(node.mention_count, base_tau)
+            if decay_tau is not None:
+                baseline = max(node.created_at, node.last_activated_at, node.last_decay_at)
+                node.weight *= math.exp(-max(now - baseline, 0.0) / decay_tau)
             node.last_decay_at = now
-            if prune_floor is not None and node.weight < prune_floor:
+            if decay_tau is not None and prune_floor is not None and node.weight < prune_floor:
                 faint.append(nid)
 
         if faint:

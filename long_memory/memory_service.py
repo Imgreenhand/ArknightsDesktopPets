@@ -89,6 +89,8 @@ class MemoryService:
                 "id": nid,
                 "text": node.text,
                 "weight": round(node.weight, 4),
+                "retention": round(self.graph.retention(nid, now, tau=self.forget_tau), 4),
+                "mention_count": node.mention_count,
                 "node_type": node.node_type,
                 "tags": node.tags,
                 "depth": 0,
